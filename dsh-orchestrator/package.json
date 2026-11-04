@@ -19,6 +19,7 @@
     "auto": "node dist/src/cli.js --auto",
     "live": "node dist/src/cli.js --live",
     "preview": "node dist/src/cli.js --frames 3",
+    "web": "tsc -p tsconfig.json && node dist/src/web/server.js",
     "demo": "tsc -p tsconfig.json && node dist/src/demo.js",
     "headless": "node dist/src/demo.js",
     "test": "tsc -p tsconfig.json && node dist/tests/run-tests.js"

@@ -19,12 +19,13 @@ pnpm start         # 交互式 TUI
 
 | 命令 | 作用 |
 |:---|:---|
+| `pnpm run web` | 启动 Web 控制台与实时可视化页面（浏览器访问 http://127.0.0.1:3300） |
 | `pnpm start` | 交互式终端 UI（备用屏幕，↑↓/⏎/a/q） |
 | `pnpm run auto` | 自动播放：跑完 3 个任务并自动处理升级卡片（无需键盘） |
 | `pnpm run live` | 用 **DeepSeek API** 驱动整个智能体团队（需 `DEEPSEEK_API_KEY`） |
 | `pnpm run preview` | 渲染 3 帧到 stdout 后退出（非 TTY 环境预览布局） |
 | `pnpm run demo` | 无头纯文本端到端报告（录制/CI 用） |
-| `pnpm test` | 138 项断言，逐条对应一个已修复缺陷或一条引擎契约 |
+| `pnpm test` | 172 项端到端及契约断言，逐条验证核心引擎与 Web 接口契约 |
 
 运行环境变量：`AETHER_SIM_LATENCY_MS=0` 可关闭模拟的模型延迟（默认 55ms，见下文"诚实声明"）。
 

@@ -31,6 +31,7 @@ import { VerificationEngine, auditFor } from '../src/verification/verification-e
 import { SelfLoopEngine } from '../src/selfloop/self-loop-engine.js';
 import { FeedbackOptimizer } from '../src/optimization/feedback-optimizer.js';
 import { Orchestrator } from '../src/orchestrator.js';
+import { WebServer } from '../src/web/server.js';
 import { AgentProfile, VerificationSpec, WorkflowDefinition } from '../src/types/index.js';
 import {
   BASE_FEATURES,
@@ -1040,6 +1041,107 @@ async function suiteLlm(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// [11] Web Dashboard & API Server
+// ---------------------------------------------------------------------------
+
+async function suiteWebServer(): Promise<void> {
+  describe('[11] web dashboard & API server');
+
+  const server = new WebServer({ port: 0 });
+  const info = await server.start();
+
+  try {
+    check(info.port > 0, `web server listens on ephemeral port (${info.port})`);
+
+    // 1. Root HTML
+    const htmlRes = await fetch(`${info.url}/`);
+    equal(htmlRes.status, 200, 'GET / returns 200 OK');
+    const contentType = htmlRes.headers.get('content-type') ?? '';
+    check(contentType.includes('text/html'), 'GET / serves text/html');
+    const htmlText = await htmlRes.text();
+    check(htmlText.includes('AetherHarness'), 'HTML includes AetherHarness brand');
+    check(htmlText.includes('pipeline-flow'), 'HTML includes workflow DAG pipeline view');
+
+    // 2. Status API
+    const statusRes = await fetch(`${info.url}/api/status`);
+    equal(statusRes.status, 200, 'GET /api/status returns 200 OK');
+    const statusData = await statusRes.json();
+    equal(statusData.status, 'ok', 'status data reports ok');
+    check(Array.isArray(statusData.runs), 'status data lists runs');
+
+    // 3. Agents API
+    const agentsRes = await fetch(`${info.url}/api/agents`);
+    equal(agentsRes.status, 200, 'GET /api/agents returns 200 OK');
+    const agents = await agentsRes.json();
+    equal(agents.length, 6, 'agents endpoint returns all 6 specialized agents');
+    check(agents.some((a: any) => a.profile.name.includes('Sarah')), 'Sarah is registered');
+    check(agents.some((a: any) => a.profile.name.includes('Marcus')), 'Marcus is registered');
+
+    // 4. SSE Events endpoint
+    const ac = new AbortController();
+    const ssePromise = fetch(`${info.url}/api/events`, { signal: ac.signal });
+    const sseRes = await ssePromise;
+    equal(sseRes.status, 200, 'GET /api/events returns 200 OK');
+    equal(sseRes.headers.get('content-type'), 'text/event-stream', 'SSE content-type is text/event-stream');
+    ac.abort(); // close SSE client
+
+    // 5. Trigger task run (rl-normal produces patch)
+    const runRes = await fetch(`${info.url}/api/tasks/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskId: 'rl-normal' })
+    });
+    equal(runRes.status, 200, 'POST /api/tasks/run returns 200 OK');
+    const runData = await runRes.json();
+    equal(runData.success, true, 'task dispatch reports success');
+
+    // Poll until run finishes
+    let finishedRun: any;
+    for (let i = 0; i < 40; i++) {
+      await new Promise(r => setTimeout(r, 50));
+      const runsRes = await fetch(`${info.url}/api/runs`);
+      const runs = await runsRes.json();
+      finishedRun = runs.find((r: any) => r.taskId === 'rl-normal');
+      if (finishedRun && finishedRun.status === 'completed') break;
+    }
+    check(finishedRun !== undefined, 'rl-normal run was recorded');
+    equal(finishedRun?.status, 'completed', 'rl-normal run completed successfully');
+    check(finishedRun?.patch?.patch?.includes('--- a/'), 'run produced a unified diff patch');
+
+    // 6. Test Escalation flow via API
+    await fetch(`${info.url}/api/tasks/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskId: 'rl-hard' })
+    });
+
+    let hardRun: any;
+    for (let i = 0; i < 40; i++) {
+      await new Promise(r => setTimeout(r, 50));
+      const runsRes = await fetch(`${info.url}/api/runs`);
+      const runs = await runsRes.json();
+      hardRun = runs.find((r: any) => r.taskId === 'rl-hard');
+      if (hardRun && hardRun.status === 'needs_human') break;
+    }
+    check(hardRun !== undefined, 'rl-hard run was recorded');
+    equal(hardRun?.status, 'needs_human', 'rl-hard correctly escalates to human (needs_human)');
+
+    // Resolve escalation via POST /api/runs/:id/escalate
+    const escRes = await fetch(`${info.url}/api/runs/${hardRun.runId}/escalate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ optionIndex: 1 })
+    });
+    equal(escRes.status, 200, 'POST /api/runs/:id/escalate returns 200 OK');
+    const escData = await escRes.json();
+    equal(escData.success, true, 'escalation resolution reports success');
+    equal(escData.run.status, 'completed', 'escalation resolution marks run as completed');
+  } finally {
+    await server.stop();
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
   const started = Date.now();
@@ -1056,6 +1158,7 @@ async function main(): Promise<void> {
   await suiteSelfLoop();
   await suiteEndToEnd();
   await suiteLlm();
+  await suiteWebServer();
 
   const elapsed = Date.now() - started;
   process.stdout.write('\n' + '='.repeat(64) + '\n');

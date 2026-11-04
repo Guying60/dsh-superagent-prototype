@@ -12,6 +12,7 @@
  */
 import { TuiApp } from './tui/app.js';
 import { runHeadless } from './demo.js';
+import { WebServer } from './web/server.js';
 import { style } from './tui/ansi.js';
 import { LlmConfig, isLlmConfigured, resolveLlmConfig } from './agent/llm/index.js';
 
@@ -19,6 +20,8 @@ interface Args {
   auto: boolean;
   plain: boolean;
   headless: boolean;
+  web: boolean;
+  port?: number;
   frames?: number;
   help: boolean;
   live: boolean;
@@ -33,6 +36,7 @@ function parseArgs(argv: string[]): Args {
     auto: false,
     plain: false,
     headless: false,
+    web: false,
     help: false,
     live: false,
     noFallback: false
@@ -41,6 +45,15 @@ function parseArgs(argv: string[]): Args {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     switch (arg) {
+      case '-w':
+      case '--web':
+        args.web = true;
+        break;
+      case '--port': {
+        const next = Number(argv[++i]);
+        if (Number.isFinite(next) && next > 0) args.port = next;
+        break;
+      }
       case '-a':
       case '--auto':
         args.auto = true;
@@ -97,6 +110,8 @@ ${style.bold}Usage${style.reset}
 
 ${style.bold}Run modes${style.reset}
   (none)          interactive TUI (alternate screen)
+  -w, --web       start web dashboard (HTTP + Server-Sent Events, default: 3300)
+      --port N    specify port for web server
   -a, --auto      auto-play: run every task, auto-resolve the escalation card
   -p, --plain     render the UI without the alternate screen (pipe-friendly)
   -f, --frames N  render N frames to stdout and exit (layout preview)
@@ -167,6 +182,26 @@ async function main(): Promise<void> {
 
   if (args.headless) {
     process.exit(await runHeadless({ llm }));
+    return;
+  }
+
+  if (args.web) {
+    const server = new WebServer({ port: args.port, llm });
+    const info = await server.start();
+    process.stdout.write(
+      `\n${style.cyan}⚡ AetherHarness Web Dashboard listening at ${style.bold}${info.url}${style.reset}\n` +
+        `   Interactive multi-agent orchestration, dynamic scheduling & self-loop UI\n` +
+        `   Press Ctrl+C to stop.\n\n`
+    );
+
+    const shutdown = async () => {
+      process.stdout.write('\nShutting down web server...\n');
+      await server.stop();
+      process.exit(0);
+    };
+
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
     return;
   }
 
