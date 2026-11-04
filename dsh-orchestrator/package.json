@@ -1,0 +1,23 @@
+{
+  "name": "dsh-agent-orchestrator",
+  "version": "1.0.0",
+  "description": "Multi-Agent Orchestration, Dynamic Scheduling, Self-Loop and Verification Platform based on DeepSeek Harness philosophy",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "tsc && node dist/src/demo.js",
+    "demo": "tsc && node dist/src/demo.js",
+    "test": "tsc && node dist/tests/run-tests.js"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "multi-agent",
+    "orchestration",
+    "self-loop",
+    "verification",
+    "scheduler"
+  ],
+  "author": "DeepSeek Harness Competition Team",
+  "license": "MIT"
+}
