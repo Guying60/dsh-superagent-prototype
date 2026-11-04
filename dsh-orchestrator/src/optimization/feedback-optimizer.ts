@@ -1,103 +1,114 @@
 /**
- * Feedback & Self-Optimization Engine
- * Features:
- * 1. Prompt Auto-Refinement based on failure diagnostics
- * 2. Tool Selection & Ranking Adaptation based on call history
- * 3. Workflow Path Self-Healing & Alternative Routing
+ * Feedback & Self-Optimization
+ *
+ * Fixes vs. the previous version:
+ * - every method here is now invoked by the running system (previously the class was
+ *   instantiated by the scenario and then never called — the demo printed "0 adjustments")
+ * - prompt refinement is idempotent: re-applying the same failure does not keep appending
+ *   identical guardrails (the old code grew the system prompt without bound)
+ * - tool reliability is read from real ToolRegistry metrics instead of manual bookkeeping
  */
 import { AgentRegistry } from '../agent/agent-registry.js';
-import { VerificationResult, WorkflowNode, WorkflowDefinition } from '../types/index.js';
+import { ToolRegistry } from '../tools/tool-registry.js';
+import { VerificationResult, WorkflowNode, RuleFailure } from '../types/index.js';
 
 export interface PromptOptimizationRecord {
   agentId: string;
-  originalPrompt: string;
-  refinedPrompt: string;
+  addedGuardrails: string[];
   appliedFix: string;
   timestamp: number;
+  iteration?: number;
 }
 
-export class FeedbackOptimizer {
-  private agentRegistry: AgentRegistry;
-  private promptHistory: PromptOptimizationRecord[] = [];
-  private toolSuccessStats: Map<string, { calls: number; successes: number }> = new Map();
+const GUARDRAIL_MARK = '[AUTOMATIC SELF-OPTIMIZATION GUARDRAILS]';
 
-  constructor(agentRegistry: AgentRegistry) {
-    this.agentRegistry = agentRegistry;
-  }
+export class FeedbackOptimizer {
+  private promptHistory: PromptOptimizationRecord[] = [];
+
+  constructor(
+    private agentRegistry: AgentRegistry,
+    private toolRegistry?: ToolRegistry
+  ) {}
 
   /**
-   * 1. Prompt Auto-Refinement
-   * Enhances an agent's system prompt with guardrails derived from verification failures
+   * Append structured negative constraints derived from real verification failures.
+   * Idempotent: a guardrail already present in the prompt is not appended again.
    */
   public autoRefinePrompt(
-    agentId: string, 
-    verification: VerificationResult
+    agentId: string,
+    verification: VerificationResult,
+    iteration?: number
   ): PromptOptimizationRecord | null {
     const agent = this.agentRegistry.get(agentId);
     if (!agent) return null;
 
-    const failedRules = verification.ruleResults.filter(r => !r.passed);
-    const sandboxErrors = verification.sandboxTestResult?.output || '';
-    
-    if (failedRules.length === 0 && !sandboxErrors) return null;
+    const failures: RuleFailure[] = [
+      ...verification.ruleResults
+        .filter(r => !r.passed)
+        .map(r => ({ id: r.ruleId, ruleName: r.ruleName, message: r.message, severity: r.severity as any })),
+      ...(verification.auditorReviews ?? [])
+        .filter(r => !r.approved)
+        .flatMap(r => (r.signals ?? []).map(id => ({ id, ruleName: `auditor:${r.agentId}`, message: r.comments })))
+    ];
 
-    const originalPrompt = agent.profile.systemPrompt;
+    if (!verification.sandboxTestResult?.passed && verification.sandboxTestResult) {
+      failures.push({
+        id: verification.sandboxTestResult.output.match(/\b([A-Z]{2,6}-\d{3})\b/)?.[1],
+        ruleName: 'sandbox',
+        message: verification.sandboxTestResult.output
+      });
+    }
+
+    if (failures.length === 0) return null;
+
+    const current = agent.profile.systemPrompt;
     const additions: string[] = [];
 
-    for (const rule of failedRules) {
-      additions.push(`- CRITICAL REQUIREMENT: Avoid failure '${rule.ruleName}'. Requirement: ${rule.message}`);
+    for (const f of failures) {
+      const key = f.id ?? f.ruleName;
+      const line = `- MUST satisfy ${key}: ${f.message} (severity: ${f.severity ?? 'critical'})`;
+      if (!current.includes(line) && !additions.includes(line)) additions.push(line);
     }
 
-    if (sandboxErrors) {
-      additions.push(`- TESTING GUARDRAIL: Previous attempt failed tests with error: ${sandboxErrors}. Ensure code strictly satisfies all assertion types and edge conditions.`);
-    }
+    if (additions.length === 0) return null;
 
-    const refinedPrompt = `${originalPrompt}\n\n[AUTOMATIC SELF-OPTIMIZATION GUARDRAILS]\n${additions.join('\n')}`;
-    agent.updateSystemPrompt(refinedPrompt);
+    const marker = current.includes(GUARDRAIL_MARK)
+      ? ''
+      : `\n\n${GUARDRAIL_MARK}`;
+    agent.updateSystemPrompt(`${current}${marker}\n${additions.join('\n')}`);
 
     const record: PromptOptimizationRecord = {
       agentId,
-      originalPrompt,
-      refinedPrompt,
-      appliedFix: additions.join('; '),
-      timestamp: Date.now()
+      addedGuardrails: additions,
+      appliedFix: additions.map(a => a.replace(/^- /, '')).join('; '),
+      timestamp: Date.now(),
+      iteration
     };
-
     this.promptHistory.push(record);
     return record;
   }
 
-  /**
-   * 2. Tool Selection Adaptation
-   * Records tool invocation success and computes reliability scores
-   */
-  public recordToolCall(toolId: string, success: boolean): void {
-    const stats = this.toolSuccessStats.get(toolId) || { calls: 0, successes: 0 };
-    stats.calls++;
-    if (success) stats.successes++;
-    this.toolSuccessStats.set(toolId, stats);
+  /** Mean reported reliability of every tool that has actually been called. */
+  public getToolReliability(): Array<{ toolId: string; reliability: number; calls: number }> {
+    if (!this.toolRegistry) return [];
+    return this.toolRegistry
+      .getMetrics()
+      .filter(m => m.calls > 0)
+      .map(m => ({ toolId: m.toolId, reliability: m.successes / m.calls, calls: m.calls }))
+      .sort((a, b) => b.calls - a.calls);
   }
 
-  public getToolReliabilityScore(toolId: string): number {
-    const stats = this.toolSuccessStats.get(toolId);
-    if (!stats || stats.calls === 0) return 1.0; // default optimism
-    return stats.successes / stats.calls;
-  }
+  /** Path self-healing: re-route a node to the best alternative agent for a capability. */
+  public healWorkflowNode(node: WorkflowNode, requiredCapability: string): { healed: boolean; from?: string; to?: string } {
+    if (node.type !== 'agent') return { healed: false };
 
-  /**
-   * 3. Workflow Path Self-Healing
-   * Re-routes failed node to alternative candidate agent
-   */
-  public healWorkflowNode(node: WorkflowNode, requiredCapability: string): boolean {
-    if (node.type !== 'agent') return false;
-    
-    const fallbackAgent = this.agentRegistry.findBestAgent(requiredCapability, 0.7);
-    if (fallbackAgent && fallbackAgent.id !== node.agentId) {
-      const prev = node.agentId;
-      node.agentId = fallbackAgent.id;
-      return true;
+    const fallback = this.agentRegistry.findBestAgent(requiredCapability, 0.7);
+    if (fallback && fallback.id !== node.agentId) {
+      const from = node.agentId;
+      node.agentId = fallback.id;
+      return { healed: true, from, to: fallback.id };
     }
-    return false;
+    return { healed: false };
   }
 
   public getOptimizationHistory(): PromptOptimizationRecord[] {

@@ -1,23 +1,42 @@
 {
-  "name": "dsh-agent-orchestrator",
-  "version": "1.0.0",
-  "description": "Multi-Agent Orchestration, Dynamic Scheduling, Self-Loop and Verification Platform based on DeepSeek Harness philosophy",
+  "name": "aether-harness",
+  "version": "2.0.0",
+  "description": "AetherHarness / DSH-Orchestrator — multi-agent self-healing orchestration, dynamic scheduling and trustworthy verification with an interactive terminal UI",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "bin": {
+    "aether": "dist/src/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "build": "tsc",
-    "start": "tsc && node dist/src/demo.js",
-    "demo": "tsc && node dist/src/demo.js",
-    "test": "tsc && node dist/tests/run-tests.js"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "tsc -p tsconfig.json && node dist/src/cli.js",
+    "tui": "node dist/src/cli.js",
+    "auto": "node dist/src/cli.js --auto",
+    "live": "node dist/src/cli.js --live",
+    "preview": "node dist/src/cli.js --frames 3",
+    "demo": "tsc -p tsconfig.json && node dist/src/demo.js",
+    "headless": "node dist/src/demo.js",
+    "test": "tsc -p tsconfig.json && node dist/tests/run-tests.js"
   },
   "keywords": [
-    "deepseek-harness",
     "multi-agent",
     "orchestration",
     "self-loop",
+    "pdca",
+    "scheduler",
     "verification",
-    "scheduler"
+    "tui",
+    "deepseek-harness"
   ],
-  "author": "DeepSeek Harness Competition Team",
-  "license": "MIT"
+  "author": "AetherHarness team",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "7.0.2"
+  }
 }

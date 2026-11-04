@@ -60,7 +60,7 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
 /** True when a regular file starts with the dsh-superagent marker in its first two lines; a symbolic link, directory, or other non-regular file never counts as written by dsh-superagent. */
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
-  const head = (await readFile(file, 'utf8')).split('\n', 2)
+  const head = (await readFile(file, 'utf8')).split('\n', 2).map(line => line.trim())
   return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
@@ -84,11 +84,19 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   for (const name of before) { const file = join(dir, name); if (!await written(file)) throw new SetupError('foreignFile', { file }) }
   // Workers may be running concurrently: write each shim to a temp file and atomically rename it so no command ever resolves past the shim directory.
   const kept = new Set<string>()
-  const shim = async (name: string, body: string): Promise<void> => {
+  const shim = async (name: string, body: string, cmdTarget?: string): Promise<void> => {
     const temporary = join(dir, `.${name}.${process.pid}.tmp`)
     await writeFile(temporary, `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
     await rename(temporary, join(dir, name))
     kept.add(name)
+    if (process.platform === 'win32') {
+      const cmdName = `${name}.cmd`
+      const cmdTemp = join(dir, `.${cmdName}.${process.pid}.tmp`)
+      const cmdBody = `@echo off\r\n${MARKER}\r\n${cmdTarget ? `"${cmdTarget}" %*` : `echo ${name} is blocked & exit /b 1`}\r\n`
+      await writeFile(cmdTemp, cmdBody)
+      await rename(cmdTemp, join(dir, cmdName))
+      kept.add(cmdName)
+    }
   }
   const withoutShims = [
     `self=${shellQuote(dir)}`, 'rest=', 'IFS=:', 'set -f',
@@ -97,8 +105,8 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   ].join('\n')
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', run(github.cli))
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  await shim('gh', run(github.cli), github.cli)
+  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'), feishu?.cli)
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
     await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
   }

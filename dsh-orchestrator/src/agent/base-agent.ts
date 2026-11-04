@@ -1,13 +1,18 @@
 /**
- * Base Agent Implementation with Memory, Tools Binding & Execution Loop
+ * Base Agent — profile, sliding working memory, tool binding and a brain slot.
+ *
+ * Behaviour is delegated to an `AgentBrain`; this class only owns the deterministic
+ * concerns: load accounting, memory window, token estimation and error isolation.
  */
-import { 
-  AgentProfile, 
-  AgentExecutionRequest, 
-  AgentExecutionResult, 
-  ToolCallTrace 
+import {
+  AgentProfile,
+  AgentExecutionRequest,
+  AgentExecutionResult,
+  ToolCallTrace,
+  RuleFailure
 } from '../types/index.js';
 import { ToolRegistry } from '../tools/tool-registry.js';
+import { AgentBrain, BrainContext, DeterministicBrain, estimateTokens } from './brain.js';
 
 export interface AgentMemoryEntry {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -16,14 +21,23 @@ export interface AgentMemoryEntry {
   metadata?: Record<string, any>;
 }
 
+const MEMORY_WINDOW = 50;
+
 export class BaseAgent {
   public profile: AgentProfile;
   protected memory: AgentMemoryEntry[] = [];
   protected toolRegistry?: ToolRegistry;
+  protected brain: AgentBrain;
 
-  constructor(profile: AgentProfile, toolRegistry?: ToolRegistry) {
-    this.profile = { ...profile };
+  constructor(profile: AgentProfile, toolRegistry?: ToolRegistry, brain?: AgentBrain) {
+    // deep-ish copy so external mutation of the profile cannot silently corrupt the agent
+    this.profile = {
+      ...profile,
+      capabilities: { ...profile.capabilities },
+      toolIds: [...profile.toolIds]
+    };
     this.toolRegistry = toolRegistry;
+    this.brain = brain ?? new DeterministicBrain();
   }
 
   public get id(): string {
@@ -38,15 +52,17 @@ export class BaseAgent {
     return this.profile.currentLoad;
   }
 
+  public get brainName(): string {
+    return this.brain.name;
+  }
+
+  public setBrain(brain: AgentBrain): void {
+    this.brain = brain;
+  }
+
   public addMemory(entry: Omit<AgentMemoryEntry, 'timestamp'>): void {
-    this.memory.push({
-      ...entry,
-      timestamp: Date.now()
-    });
-    // keep sliding window of recent memories
-    if (this.memory.length > 50) {
-      this.memory.shift();
-    }
+    this.memory.push({ ...entry, timestamp: Date.now() });
+    while (this.memory.length > MEMORY_WINDOW) this.memory.shift();
   }
 
   public getMemories(): AgentMemoryEntry[] {
@@ -61,114 +77,96 @@ export class BaseAgent {
     this.profile.systemPrompt = newPrompt;
   }
 
-  /**
-   * Execute task logic. Supports deterministic execution, tool calls, and LLM reasoning.
-   */
-  public async execute(
-    request: AgentExecutionRequest, 
-    customHandler?: (req: AgentExecutionRequest, agent: BaseAgent) => Promise<{ output: any; reasoning: string; toolCalls?: ToolCallTrace[]; confidence?: number }>
-  ): Promise<AgentExecutionResult> {
+  /** Reject execution when the agent is already at its concurrency ceiling. */
+  public hasCapacity(): boolean {
+    return this.profile.currentLoad < this.profile.maxConcurrency;
+  }
+
+  public async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
     const startTime = Date.now();
     this.profile.currentLoad++;
+
+    const failedRules: RuleFailure[] = request.failedRules ?? [];
 
     try {
       this.addMemory({
         role: 'user',
-        content: JSON.stringify(request.input),
-        metadata: { taskId: request.taskId }
+        content: JSON.stringify(request.input).slice(0, 2000),
+        metadata: { taskId: request.taskId, iteration: request.iteration }
       });
 
-      let output: any;
-      let reasoning = '';
-      let toolCalls: ToolCallTrace[] = [];
-      let confidence = 0.90;
+      const ctx: BrainContext = {
+        agent: this.profile,
+        request,
+        failedRules,
+        iteration: request.iteration ?? 1,
+        criticGuidance: request.criticGuidance,
+        memory: this.memory.slice(-8).map(m => ({ role: m.role, content: m.content })),
+        callTool: (toolId, params) => this.callTool(toolId, params)
+      };
 
-      if (customHandler) {
-        const res = await customHandler(request, this);
-        output = res.output;
-        reasoning = res.reasoning;
-        toolCalls = res.toolCalls || [];
-        if (res.confidence !== undefined) confidence = res.confidence;
-      } else {
-        // Default simulated reasoning based on role and capabilities
-        reasoning = `[${this.profile.name}] Analyzed input using capabilities: ${Object.keys(this.profile.capabilities).join(', ')}`;
-        output = {
-          processedBy: this.profile.id,
-          role: this.profile.role,
-          result: `Default execution output for task ${request.taskId}`,
-          receivedInput: request.input
-        };
-      }
+      const res = await this.brain.think(ctx);
 
-      const durationMs = Date.now() - startTime;
-      const tokensUsed = Math.floor(reasoning.length / 3) + 120;
+      const reasoning = res.reasoning || '';
+      const tokensUsed =
+        res.tokensUsed ??
+        estimateTokens(reasoning, JSON.stringify(request.input), JSON.stringify(res.output ?? null));
+
       this.profile.totalTokensUsed += tokensUsed;
 
+      const outputText = typeof res.output === 'string' ? res.output : JSON.stringify(res.output ?? null);
       this.addMemory({
         role: 'assistant',
-        content: typeof output === 'string' ? output : JSON.stringify(output),
-        metadata: { taskId: request.taskId, durationMs, confidence }
+        content: outputText.slice(0, 2000),
+        metadata: { taskId: request.taskId, confidence: res.confidence, iteration: request.iteration }
       });
 
       return {
         taskId: request.taskId,
         agentId: this.profile.id,
         success: true,
-        output,
+        output: res.output,
         reasoning,
-        toolCalls,
-        confidence,
+        toolCalls: res.toolCalls ?? [],
+        confidence: res.confidence ?? 0.9,
         tokensUsed,
-        durationMs
+        durationMs: Date.now() - startTime
       };
     } catch (err: any) {
+      const message = err?.message ?? String(err);
       return {
         taskId: request.taskId,
         agentId: this.profile.id,
         success: false,
         output: null,
-        reasoning: `Error occurred during execution: ${err.message}`,
+        reasoning: `Agent execution failed: ${message}`,
         toolCalls: [],
         confidence: 0,
-        tokensUsed: 50,
+        tokensUsed: estimateTokens(message),
         durationMs: Date.now() - startTime,
-        error: err.message
+        error: message
       };
     } finally {
       this.profile.currentLoad = Math.max(0, this.profile.currentLoad - 1);
     }
   }
 
-  /**
-   * Helper to execute a tool registered with this agent
-   */
+  /** Invoke an authorized tool and always return a trace instead of throwing. */
   public async callTool(toolId: string, params: any): Promise<ToolCallTrace> {
+    const start = Date.now();
+
     if (!this.toolRegistry) {
-      throw new Error(`ToolRegistry not bound to agent ${this.profile.id}`);
+      return { toolId, input: params, output: null, durationMs: 0, success: false, error: `ToolRegistry not bound to agent ${this.profile.id}` };
     }
     if (!this.profile.toolIds.includes(toolId)) {
-      throw new Error(`Tool '${toolId}' is not authorized for agent '${this.profile.id}'`);
+      return { toolId, input: params, output: null, durationMs: 0, success: false, error: `Tool '${toolId}' is not authorized for agent '${this.profile.id}'` };
     }
 
-    const start = Date.now();
     try {
       const output = await this.toolRegistry.invoke(toolId, params);
-      return {
-        toolId,
-        input: params,
-        output,
-        durationMs: Date.now() - start,
-        success: true
-      };
+      return { toolId, input: params, output, durationMs: Date.now() - start, success: true };
     } catch (err: any) {
-      return {
-        toolId,
-        input: params,
-        output: null,
-        durationMs: Date.now() - start,
-        success: false,
-        error: err.message
-      };
+      return { toolId, input: params, output: null, durationMs: Date.now() - start, success: false, error: err?.message ?? String(err) };
     }
   }
 }

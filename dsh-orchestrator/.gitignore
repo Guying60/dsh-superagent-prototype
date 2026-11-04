@@ -1,5 +1,5 @@
 node_modules
 dist
 *.log
-tests/run-tests.js
-tests/run-tests.d.ts
+tmp-*
+.aether

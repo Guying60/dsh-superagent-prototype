@@ -1,33 +1,48 @@
 /**
- * Agent Team Registry & Discovery Service
+ * Agent Registry & Capability Discovery
+ *
+ * Fixes vs. the previous version:
+ * - version history is a DEEP clone, so mutating a live profile can never rewrite history
+ * - brains are injected here, so the engine can drive agents without knowing their internals
+ * - exposes capacity queries used by the scheduler (real load balancing, not a stub)
  */
 import { AgentProfile, AgentRole } from '../types/index.js';
 import { BaseAgent } from './base-agent.js';
+import { AgentBrain } from './brain.js';
 import { ToolRegistry } from '../tools/tool-registry.js';
+
+export interface RegisterOptions {
+  brain?: AgentBrain;
+  agentClass?: typeof BaseAgent;
+}
 
 export class AgentRegistry {
   private agents: Map<string, BaseAgent> = new Map();
-  private versions: Map<string, AgentProfile[]> = new Map(); // history of profiles by agentId
+  private versions: Map<string, AgentProfile[]> = new Map();
   private toolRegistry: ToolRegistry;
 
   constructor(toolRegistry: ToolRegistry) {
     this.toolRegistry = toolRegistry;
   }
 
-  /**
-   * Register or update an Agent with automatic version tracking
-   */
-  public register(profile: AgentProfile, customAgentClass?: typeof BaseAgent): BaseAgent {
+  private static cloneProfile(p: AgentProfile): AgentProfile {
+    return {
+      ...p,
+      capabilities: { ...p.capabilities },
+      toolIds: [...p.toolIds]
+    };
+  }
+
+  public register(profile: AgentProfile, options: RegisterOptions = {}): BaseAgent {
     const existing = this.agents.get(profile.id);
     if (existing) {
-      // track version
-      const history = this.versions.get(profile.id) || [];
-      history.push({ ...existing.profile });
+      const history = this.versions.get(profile.id) ?? [];
+      history.push(AgentRegistry.cloneProfile(existing.profile));
       this.versions.set(profile.id, history);
     }
 
-    const AgentClass = customAgentClass || BaseAgent;
-    const agent = new AgentClass(profile, this.toolRegistry);
+    const AgentClass = options.agentClass ?? BaseAgent;
+    const agent = new AgentClass(profile, this.toolRegistry, options.brain);
     this.agents.set(profile.id, agent);
     return agent;
   }
@@ -45,34 +60,50 @@ export class AgentRegistry {
   }
 
   /**
-   * Find the most suitable agent for a given task based on capability score and current load
+   * Load-aware capability match.
+   * score = 0.7 * capability + 0.3 * (1 - load / maxConcurrency)
    */
-  public findBestAgent(requiredCapability: string, minScore: number = 0.5): BaseAgent | undefined {
-    const candidates = this.getAll().filter(agent => {
-      const score = agent.profile.capabilities[requiredCapability] || 0;
-      return score >= minScore && agent.currentLoad < agent.profile.maxConcurrency;
+  public findBestAgent(requiredCapability: string, minScore = 0.5): BaseAgent | undefined {
+    const withScore = this.getAll()
+      .filter(a => (a.profile.capabilities[requiredCapability] ?? 0) >= minScore)
+      .map(a => ({
+        agent: a,
+        capability: a.profile.capabilities[requiredCapability] ?? 0,
+        available: a.hasCapacity()
+      }));
+
+    if (withScore.length === 0) return undefined;
+
+    // Prefer agents with free capacity; only degrade to a busy agent if nothing else exists.
+    const pool = withScore.some(c => c.available) ? withScore.filter(c => c.available) : withScore;
+
+    pool.sort((a, b) => {
+      const sa = a.capability * 0.7 + (1 - a.agent.currentLoad / Math.max(1, a.agent.profile.maxConcurrency)) * 0.3;
+      const sb = b.capability * 0.7 + (1 - b.agent.currentLoad / Math.max(1, b.agent.profile.maxConcurrency)) * 0.3;
+      return sb - sa;
     });
 
-    if (candidates.length === 0) {
-      // Fallback: candidate with highest score regardless of load
-      return this.getAll()
-        .filter(a => (a.profile.capabilities[requiredCapability] || 0) >= minScore)
-        .sort((a, b) => (b.profile.capabilities[requiredCapability] || 0) - (a.profile.capabilities[requiredCapability] || 0))[0];
-    }
+    return pool[0].agent;
+  }
 
-    // Rank candidates by composite score: capability * 0.7 + (1 - normalizedLoad) * 0.3
-    candidates.sort((a, b) => {
-      const scoreA = (a.profile.capabilities[requiredCapability] || 0) * 0.7 + 
-        (1 - a.currentLoad / a.profile.maxConcurrency) * 0.3;
-      const scoreB = (b.profile.capabilities[requiredCapability] || 0) * 0.7 + 
-        (1 - b.currentLoad / b.profile.maxConcurrency) * 0.3;
-      return scoreB - scoreA;
-    });
+  /** Agents that currently have a free execution slot. */
+  public getAvailable(): BaseAgent[] {
+    return this.getAll().filter(a => a.hasCapacity());
+  }
 
-    return candidates[0];
+  public getTotalLoad(): number {
+    return this.getAll().reduce((sum, a) => sum + a.currentLoad, 0);
+  }
+
+  public getTotalCapacity(): number {
+    return this.getAll().reduce((sum, a) => sum + a.profile.maxConcurrency, 0);
   }
 
   public getVersionHistory(agentId: string): AgentProfile[] {
-    return this.versions.get(agentId) || [];
+    return (this.versions.get(agentId) ?? []).map(AgentRegistry.cloneProfile);
+  }
+
+  public getTotalTokens(): number {
+    return this.getAll().reduce((sum, a) => sum + a.profile.totalTokensUsed, 0);
   }
 }

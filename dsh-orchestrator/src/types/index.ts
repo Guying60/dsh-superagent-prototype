@@ -1,16 +1,25 @@
 /**
- * DSH Agent Orchestrator - Core Domain Model & Types
+ * AetherHarness / DSH-Orchestrator — Core Domain Model & Contracts
+ *
  * Philosophy: Take as little human attention as possible, give as much value as possible.
+ *
+ * NOTE ON HONESTY: every field declared here is either produced or enforced by the
+ * engine. Fields that used to be decorative (`timeoutMs`, `isSandboxed`) are now
+ * actually consumed — see workflow-engine.ts / tool-registry.ts.
  */
 
-export type AgentRole = 
-  | 'orchestrator' 
-  | 'requirement_analyst' 
-  | 'architect' 
-  | 'developer' 
-  | 'code_reviewer' 
-  | 'security_auditor' 
-  | 'qa_verifier' 
+// ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+export type AgentRole =
+  | 'orchestrator'
+  | 'requirement_analyst'
+  | 'architect'
+  | 'developer'
+  | 'code_reviewer'
+  | 'security_auditor'
+  | 'qa_verifier'
   | 'critic';
 
 export interface AgentProfile {
@@ -18,7 +27,8 @@ export interface AgentProfile {
   name: string;
   role: AgentRole;
   description: string;
-  capabilities: Record<string, number>; // capability score 0.0 - 1.0 (e.g., { 'code_generation': 0.95, 'security_audit': 0.8 })
+  /** capability tag -> score in [0,1] */
+  capabilities: Record<string, number>;
   systemPrompt: string;
   toolIds: string[];
   maxConcurrency: number;
@@ -29,6 +39,14 @@ export interface AgentProfile {
   version: string;
 }
 
+/** A single rule failure surfaced to the executing brain so it can repair. */
+export interface RuleFailure {
+  id?: string;
+  ruleName: string;
+  message: string;
+  severity?: 'critical' | 'warning' | 'info';
+}
+
 export interface AgentExecutionRequest {
   taskId: string;
   agentId: string;
@@ -36,6 +54,12 @@ export interface AgentExecutionRequest {
   context?: Record<string, any>;
   retrievedDocs?: KnowledgeQueryResult[];
   systemPromptOverride?: string;
+  /** 1-based self-loop iteration, when executed inside a loop. */
+  iteration?: number;
+  /** Critic guidance produced by the previous iteration. */
+  criticGuidance?: string;
+  /** Structured failures of the previous attempt — drives repair brains. */
+  failedRules?: RuleFailure[];
 }
 
 export interface ToolCallTrace {
@@ -54,13 +78,15 @@ export interface AgentExecutionResult {
   output: any;
   reasoning: string;
   toolCalls: ToolCallTrace[];
-  confidence: number; // 0.0 - 1.0
+  confidence: number;
   tokensUsed: number;
   durationMs: number;
   error?: string;
 }
 
-// ---------------- Knowledge & RAG ----------------
+// ---------------------------------------------------------------------------
+// Knowledge & RAG
+// ---------------------------------------------------------------------------
 
 export interface KnowledgeChunk {
   id: string;
@@ -82,12 +108,16 @@ export interface KnowledgeBaseConfig {
   id: string;
   name: string;
   description: string;
+  /** soft target size of a chunk, measured in tokens (CJK-aware) */
   chunkSize: number;
   chunkOverlap: number;
-  hybridAlpha: number; // 0.0 = keyword only, 1.0 = vector only, 0.5 = balanced
+  /** 0.0 = keyword only, 1.0 = vector only */
+  hybridAlpha: number;
 }
 
-// ---------------- Tools & MCP ----------------
+// ---------------------------------------------------------------------------
+// Tools & MCP
+// ---------------------------------------------------------------------------
 
 export interface ToolParameterSchema {
   type: 'object';
@@ -104,34 +134,61 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: ToolParameterSchema;
+  /** When true the handler runs in an isolated vm context with a hard timeout. */
   isSandboxed?: boolean;
   timeoutMs?: number;
   handler: (params: any, context?: any) => Promise<any>;
 }
 
-// ---------------- Workflow & DAG ----------------
+// ---------------------------------------------------------------------------
+// Workflow & DAG
+// ---------------------------------------------------------------------------
 
-export type WorkflowNodeType = 
-  | 'agent' 
-  | 'tool' 
-  | 'condition' 
-  | 'parallel_group' 
-  | 'subworkflow' 
-  | 'verification' 
+export type WorkflowNodeType =
+  | 'agent'
+  | 'tool'
+  | 'condition'
+  | 'parallel_group'
+  | 'subworkflow'
+  | 'verification'
   | 'self_loop';
 
 export interface WorkflowNode {
   id: string;
   name: string;
   type: WorkflowNodeType;
+  description?: string;
+
+  // --- agent nodes ---
   agentId?: string;
+  /** capability tag used for load-balanced routing when agentId is absent */
+  agentCapability?: string;
+  /** scheduling priority 1..10 (1 = background, 10 = urgent) */
+  priority?: number;
+
+  // --- tool nodes ---
   toolId?: string;
+
+  // --- subworkflow nodes ---
   subworkflowId?: string;
-  selfLoopConfig?: SelfLoopConfig;
+
+  // --- parallel_group nodes ---
+  /** node ids executed concurrently; their outputKeys land in context */
+  parallelChildIds?: string[];
+
+  // --- verification nodes ---
   verificationSpec?: VerificationSpec;
-  conditionFn?: (context: Record<string, any>) => string; // returns branch target node id
+  /** context key holding the artifact to verify (default: `lastOutput`) */
+  verifyTargetKey?: string;
+
+  // --- self_loop nodes ---
+  selfLoopConfig?: SelfLoopConfig;
+
+  // --- control ---
+  conditionFn?: (context: Record<string, any>) => string;
   inputTransformer?: (context: Record<string, any>) => any;
-  outputKey?: string; // where to store in workflow context
+  outputKey?: string;
+  /** hard per-node budget; enforced for sandboxed tools and agent calls */
   timeoutMs?: number;
 }
 
@@ -143,10 +200,12 @@ export interface WorkflowEdge {
 
 export interface SelfLoopConfig {
   maxIterations: number;
-  targetNodeId: string; // node being iteratively refined
+  /** node re-executed on every iteration (the "DO" of PDCA) */
+  targetNodeId: string;
   criticAgentId: string;
+  /** verification node whose verificationSpec gates convergence */
   verificationNodeId: string;
-  convergenceThreshold: number; // e.g. 0.90
+  convergenceThreshold: number;
   autoPromptRefine?: boolean;
 }
 
@@ -158,19 +217,24 @@ export interface WorkflowDefinition {
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   entryNodeId: string;
+  /** wall-clock budget for the whole run; enforced between nodes */
   timeoutMs?: number;
+  /** hard guard against pathological chains */
+  maxSteps?: number;
 }
 
-export type ExecutionStatus = 
-  | 'pending' 
-  | 'running' 
-  | 'paused' 
-  | 'completed' 
-  | 'failed' 
-  | 'needs_human';
+export type ExecutionStatus =
+  | 'pending'
+  | 'running'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'needs_human'
+  | 'skipped';
 
 export interface NodeExecutionRecord {
   nodeId: string;
+  nodeName: string;
   status: ExecutionStatus;
   startTime: number;
   endTime?: number;
@@ -179,6 +243,10 @@ export interface NodeExecutionRecord {
   error?: string;
   iteration?: number;
   verification?: VerificationResult;
+  /** for condition nodes: the branch actually taken (evaluated exactly once) */
+  branchTaken?: string;
+  /** structured side-channel for the UI (e.g. self-loop iterations / score) */
+  meta?: Record<string, any>;
 }
 
 export interface WorkflowExecutionState {
@@ -193,35 +261,56 @@ export interface WorkflowExecutionState {
   startTime: number;
   endTime?: number;
   totalTokens: number;
+  steps: number;
 }
 
-// ---------------- Verification & Feedback ----------------
+// ---------------------------------------------------------------------------
+// Verification & Feedback
+// ---------------------------------------------------------------------------
 
 export interface VerificationRule {
+  /** stable id (e.g. EDGE-001) so repair strategies can key on it */
+  id?: string;
   name: string;
+  severity?: 'critical' | 'warning' | 'info';
   check: (output: any, context: Record<string, any>) => { passed: boolean; message: string; score: number };
 }
 
 export interface VerificationSpec {
   rules: VerificationRule[];
-  confidenceThreshold: number; // 0.0 - 1.0
+  confidenceThreshold: number;
   multiAgentVoting?: {
     auditorAgentIds: string[];
-    minPassRatio: number; // e.g. 0.67
+    minPassRatio: number;
   };
   executableSandboxCheck?: {
-    testScriptGenerator?: (output: any) => string;
+    /** generates test code; assertions may be prefixed with a rule id: "EDGE-001: ..." */
+    testScriptGenerator?: (output: any, context: Record<string, any>) => string;
     expectedExitCode?: number;
+    timeoutMs?: number;
   };
+}
+
+export interface VerificationTierResult {
+  tier: 'Tier-1' | 'Tier-2' | 'Tier-3';
+  name: string;
+  passed: boolean;
+  score: number;
+  detail: string;
 }
 
 export interface VerificationResult {
   passed: boolean;
-  score: number; // 0.0 - 1.0
-  ruleResults: Array<{ ruleName: string; passed: boolean; message: string; score: number }>;
-  auditorReviews?: Array<{ agentId: string; approved: boolean; comments: string; confidence: number }>;
-  sandboxTestResult?: { passed: boolean; output: string; exitCode: number };
-  diagnosticFeedback?: string; // used by Self-Loop for prompt injection / targeted fixes
+  score: number;
+  ruleResults: Array<{ ruleId?: string; ruleName: string; passed: boolean; message: string; score: number; severity?: string }>;
+  auditorReviews?: Array<{ agentId: string; approved: boolean; comments: string; confidence: number; signals?: string[] }>;
+  sandboxTestResult?: { passed: boolean; output: string; exitCode: number; passedCount?: number; totalCount?: number };
+  tiers?: VerificationTierResult[];
+  diagnosticFeedback?: string;
+  /** human-readable list of what actually blocked the verdict */
+  blockingReasons?: string[];
+  /** union of rule ids that failed across all three tiers — the repair keys */
+  failedRuleIds?: string[];
 }
 
 export interface HumanEscalationRequest {
@@ -230,20 +319,93 @@ export interface HumanEscalationRequest {
   nodeId: string;
   reason: string;
   question: string;
-  recommendedAction?: string;
+  recommendedAction: string;
+  /** index into `options` that the platform recommends; the TUI pre-selects it */
+  recommendedOptionIndex?: number;
   options: string[];
   contextSnapshot: Record<string, any>;
   createdAt: number;
 }
 
-// ---------------- Scheduler ----------------
+// ---------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------
 
 export interface ScheduledTask {
   id: string;
+  runId: string;
   workflowExecutionId: string;
   node: WorkflowNode;
-  priority: number; // 1 (low) - 10 (urgent)
+  basePriority: number;
   submittedAt: number;
   dependencies: string[];
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'retrying';
+  attempts: number;
+  startedAt?: number;
+  finishedAt?: number;
+  effectivePriority?: number;
+  assignedAgentId?: string;
+}
+
+export interface SchedulerStats {
+  queued: number;
+  running: number;
+  completed: number;
+  failed: number;
+  retried: number;
+  dispatches: number;
+  agingPromotions: number;
+  maxObservedWaitMs: number;
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration events (consumed by the TUI)
+// ---------------------------------------------------------------------------
+
+export type EventKind =
+  | 'run.started'
+  | 'run.finished'
+  | 'node.started'
+  | 'node.finished'
+  | 'loop.iteration'
+  | 'verify'
+  | 'escalation'
+  | 'scheduler'
+  | 'log';
+
+export interface OrchestratorEvent {
+  at: number;
+  runId: string;
+  kind: EventKind;
+  message: string;
+  /** short tag rendered in the log gutter */
+  tag?: string;
+  data?: Record<string, any>;
+}
+
+export interface RunSnapshotView {
+  runId: string;
+  taskId: string;
+  title: string;
+  status: ExecutionStatus;
+}
+
+// ---------------------------------------------------------------------------
+// Task catalogue
+// ---------------------------------------------------------------------------
+
+export type TaskDifficulty = 'easy' | 'normal' | 'hard';
+
+export interface TaskSpec {
+  id: string;
+  title: string;
+  description: string;
+  difficulty: TaskDifficulty;
+  /** the artifact request handed to the requirement analyst */
+  prompt: string;
+  /** build the declarative DAG for this task */
+  buildWorkflow: (engineRefs: { verificationSpec: VerificationSpec }) => WorkflowDefinition;
+  verificationSpec: VerificationSpec;
+  /** initial artifact; the developer brain refines it */
+  seed?: Record<string, any>;
 }
